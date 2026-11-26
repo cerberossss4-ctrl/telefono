@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>PagoPA QR Bridge</title>
+  <style>
+    :root { color-scheme: light dark; --blue: #0066cc; --bd: #c8ccd2; --muted: #6b7280; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 16px; font: 16px/1.45 system-ui, sans-serif; max-width: 520px; margin-inline: auto; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .pill { display: inline-block; padding: 3px 10px; border-radius: 99px; font-size: 13px; background: rgba(127,127,127,.18); }
+    .pill.ok { background: #dcfce7; color: #14532d; }
+    .pill.no { background: #fee2e2; color: #7f1d1d; }
+    .cam { position: relative; margin: 14px 0; border-radius: 12px; overflow: hidden; background: #000; aspect-ratio: 1; }
+    .cam video { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .cam .frame { position: absolute; inset: 18%; border: 3px solid rgba(255,255,255,.85); border-radius: 14px; pointer-events: none; }
+    button { font: inherit; padding: 12px 16px; border: 0; border-radius: 10px; background: var(--blue); color: #fff; width: 100%; margin-top: 8px; }
+    button.secondary { background: transparent; color: inherit; border: 1px solid var(--bd); }
+    button:disabled { opacity: .5; }
+    .card { border: 1px solid var(--bd); border-radius: 12px; padding: 12px; margin: 12px 0; }
+    .row { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; }
+    .row span:first-child { color: var(--muted); }
+    .row span:last-child { font-weight: 600; word-break: break-all; text-align: right; }
+    .raw { font-family: ui-monospace, monospace; font-size: 14px; word-break: break-all; background: rgba(127,127,127,.12); padding: 8px; border-radius: 8px; }
+    .warn { color: #b45309; }
+    .msg { margin: 10px 0; min-height: 1.4em; }
+    .msg.ok { color: #15803d; }
+    .msg.err { color: #b91c1c; }
+    textarea { width: 100%; font: inherit; padding: 8px; border-radius: 8px; border: 1px solid var(--bd); background: transparent; color: inherit; }
+    details { margin-top: 18px; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <h1>PagoPA QR Bridge</h1>
+  <div><span id="pair" class="pill">Verifica abbinamento...</span></div>
+
+  <div id="notPaired" class="card" hidden>
+    Questo telefono non e' abbinato a un PC. Apri l'estensione sul computer e inquadra il
+    <strong>QR di abbinamento</strong> con la fotocamera del telefono, poi apri il link.
+  </div>
+
+  <div id="scanner" hidden>
+    <div class="cam"><video id="video" playsinline muted></video><div class="frame"></div></div>
+    <button id="btnStart">Avvia fotocamera</button>
+  </div>
+
+  <div id="result" class="card" hidden>
+    <div id="fields"></div>
+    <button id="btnSend">Invia al PC</button>
+    <button id="btnAgain" class="secondary">Scansiona di nuovo</button>
+  </div>
+
+  <div id="msg" class="msg" role="status"></div>
+
+  <details id="manual">
+    <summary>Inserisci il testo a mano</summary>
+    <p style="font-size:14px">Incolla qui il contenuto del QR (inizia con <code>PAGOPA|002|</code>).</p>
+    <textarea id="manualText" rows="3" placeholder="PAGOPA|002|..."></textarea>
+    <button id="btnManual" class="secondary">Usa questo testo</button>
+  </details>
+
+  <script type="module">
+    import { encryptMessage } from './crypto.js';
+    import { parsePagoPA, formatEuro, formatAvviso } from './pagopa.js';
+
+    const $ = (id) => document.getElementById(id);
+    const STORE = 'pagopa-qr-bridge-session';
+
+    // ---- abbinamento: i dati stanno nel frammento (#), mai inviati a un server ----
+    function validSession(s) {
+      return s && /^pgp-[A-Za-z0-9_-]{20,}$/.test(s.topic) && /^[A-Za-z0-9_-]{43}$/.test(s.key) && /^https:\/\/[^/\s]+$/.test(s.relay);
+    }
+    function loadSession() {
+      const h = new URLSearchParams(location.hash.slice(1));
+      if (h.get('t') && h.get('k')) {
+        let relay = h.get('r') || 'https://ntfy.sh';
+        try { relay = new URL(relay).origin; } catch { /* resta com'e' */ }
+        const s = { topic: h.get('t'), key: h.get('k'), relay };
+        if (validSession(s)) {
+          try { localStorage.setItem(STORE, JSON.stringify(s)); } catch {}
+          history.replaceState(null, '', location.pathname + location.search); // toglie la chiave dalla barra
+          return s;
+        }
+      }
+      try {
+        const s = JSON.parse(localStorage.getItem(STORE) || 'null');
+        if (validSession(s)) return s;
+      } catch {}
+      return null;
+    }
+
+    const session = loadSession();
+    const msg = (text, kind = '') => { $('msg').textContent = text; $('msg').className = 'msg ' + kind; };
+
+    if (session) {
+      $('pair').textContent = 'Abbinato al PC';
+      $('pair').className = 'pill ok';
+      $('scanner').hidden = false;
+    } else {
+      $('pair').textContent = 'Non abbinato';
+      $('pair').className = 'pill no';
+      $('notPaired').hidden = false;
+      $('manual').hidden = true;
+    }
+
+    // ---- scansione ----
+    let stream = null, timer = null, detector = null, jsQR = null, scanning = false, found = null;
+    const video = $('video');
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    function loadScript(src) {
+      return new Promise((ok, ko) => {
+        const s = document.createElement('script');
+        s.src = src; s.onload = ok; s.onerror = () => ko(new Error(src));
+        document.head.append(s);
+      });
+    }
+    async function loadJsQR() {
+      if (window.jsQR) return window.jsQR;
+      // Se metti jsQR.js nella stessa cartella viene usato quello, altrimenti la CDN.
+      for (const src of ['./jsQR.js', 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js']) {
+        try { await loadScript(src); if (window.jsQR) return window.jsQR; } catch {}
+      }
+      throw new Error('Libreria di scansione non disponibile');
+    }
+
+    async function startCamera() {
+      msg('');
+      if (!navigator.mediaDevices?.getUserMedia) return msg('Fotocamera non disponibile: serve una pagina HTTPS.', 'err');
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+      } catch {
+        return msg('Accesso alla fotocamera negato. Consentilo dalle impostazioni del browser.', 'err');
+      }
+      video.srcObject = stream;
+      await video.play();
+      detector = null;
+      if ('BarcodeDetector' in window) {
+        try {
+          const f = await BarcodeDetector.getSupportedFormats();
+          if (f.includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] });
+        } catch {}
+      }
+      if (!detector) {
+        try { jsQR = await loadJsQR(); } catch (e) { stopCamera(); return msg(e.message, 'err'); }
+      }
+      $('btnStart').hidden = true;
+      scanning = true;
+      msg('Inquadra il QR dell\'avviso pagoPA');
+      tick();
+    }
+
+    function stopCamera() {
+      scanning = false;
+      clearTimeout(timer);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      stream = null;
+      video.srcObject = null;
+    }
+
+    async function tick() {
+      if (!scanning) return;
+      try {
+        let text = null;
+        if (detector) {
+          const codes = await detector.detect(video);
+          if (codes.length) text = codes[0].rawValue;
+        } else if (video.videoWidth) {
+          const w = Math.min(720, video.videoWidth);
+          const h = Math.round((w * video.videoHeight) / video.videoWidth);
+          canvas.width = w; canvas.height = h;
+          ctx.drawImage(video, 0, 0, w, h);
+          const r = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'dontInvert' });
+          if (r) text = r.data;
+        }
+        if (text) { onFound(text); return; }
+      } catch {}
+      timer = setTimeout(tick, 120);
+    }
+
+    function row(label, value) {
+      const r = document.createElement('div'); r.className = 'row';
+      const a = document.createElement('span'); a.textContent = label;
+      const b = document.createElement('span'); b.textContent = value;
+      r.append(a, b);
+      return r;
+    }
+
+    function onFound(text) {
+      stopCamera();
+      navigator.vibrate?.(60);
+      found = text;
+      const p = parsePagoPA(text);
+      const box = $('fields');
+      box.replaceChildren();
+      if (p.ok) {
+        box.append(row('Codice avviso', formatAvviso(p.avviso)), row('CF ente', p.cf), row('Importo', '€ ' + formatEuro(p.centesimi)));
+        msg('');
+      } else {
+        const w = document.createElement('p'); w.className = 'warn';
+        w.textContent = 'Questo QR non e\' un avviso pagoPA valido. Contenuto:';
+        const raw = document.createElement('div'); raw.className = 'raw'; raw.textContent = text.slice(0, 500);
+        box.append(w, raw);
+      }
+      $('btnSend').disabled = false;
+      $('btnSend').textContent = p.ok ? 'Invia al PC' : 'Invia comunque al PC';
+      $('result').hidden = false;
+      $('scanner').hidden = true;
+    }
+
+    async function send() {
+      if (!session || found == null) return;
+      $('btnSend').disabled = true;
+      msg('Invio in corso...');
+      try {
+        const body = await encryptMessage(session.key, session.topic, { v: 1, text: found, ts: Date.now() });
+        const res = await fetch(`${session.relay}/${encodeURIComponent(session.topic)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body,
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        msg('Inviato al PC. Puoi scansionare un altro avviso.', 'ok');
+        again(false);
+      } catch (e) {
+        $('btnSend').disabled = false;
+        msg('Invio non riuscito: ' + e.message, 'err');
+      }
+    }
+
+    function again(clearMsg = true) {
+      found = null;
+      $('result').hidden = true;
+      $('scanner').hidden = !session;
+      $('btnStart').hidden = false;
+      if (clearMsg) msg('');
+    }
+
+    $('btnStart').onclick = startCamera;
+    $('btnSend').onclick = send;
+    $('btnAgain').onclick = () => { again(); startCamera(); };
+    $('btnManual').onclick = () => {
+      const t = $('manualText').value.trim();
+      if (t) { $('manualText').value = ''; onFound(t); }
+    };
+    addEventListener('pagehide', stopCamera);
+    // Link di abbinamento aperto mentre la pagina e' gia' aperta: cambia solo il #, quindi si ricarica.
+    addEventListener('hashchange', () => { if (location.hash.length > 1) location.reload(); });
+  </script>
+</body>
+</html>
